@@ -1,0 +1,47 @@
+# .gitignore — CityGraph Explorer
+
+# ── Credenziali e configurazione locale ───────────────────────────────────────
+.env.local
+.env.*.local
+
+# ── Dati generati (grandi, non vanno in git) ──────────────────────────────────
+data/cache/
+data/db/
+
+# ── Docker volumi locali (se montati su host) ─────────────────────────────────
+docker/neo4j/data/
+docker/neo4j/logs/
+docker/neo4j/import/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.env/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
+.vs/
+.qodo/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Log ───────────────────────────────────────────────────────────────────────
+*.log
+logs/
+.env

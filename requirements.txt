@@ -1,0 +1,7 @@
+pygame>=2.5.0
+networkx>=3.3
+requests>=2.31.0
+neo4j>=5.19.0
+moderngl>=5.10.0
+numpy>=1.26.0
+pyglm>=2.7.0

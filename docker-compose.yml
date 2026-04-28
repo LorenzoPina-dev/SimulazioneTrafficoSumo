@@ -1,0 +1,121 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CityGraph Explorer — docker-compose.yml
+#
+#  Servizi:
+#    neo4j   → database a grafo (bolt:7687, browser:7474)
+#    app     → pipeline Python (fetch OSM → build → carica Neo4j)
+#              Profilo "app": avviato solo con --profile app
+#
+#  Comandi rapidi:
+#    docker compose up -d neo4j          # solo Neo4j in background
+#    docker compose --profile app up     # Neo4j + pipeline Python (no render)
+#    docker compose down -v              # ferma tutto e rimuove i volumi
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── NEO4J ──────────────────────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5.19-community
+    container_name: citygraph_neo4j
+    restart: unless-stopped
+
+    ports:
+      - "${NEO4J_BOLT_PORT:-7687}:7687"   # Bolt (driver Python)
+      - "${NEO4J_HTTP_PORT:-7474}:7474"   # Browser web UI
+      - "${NEO4J_HTTPS_PORT:-7473}:7473"  # HTTPS
+
+    environment:
+      # Autenticazione
+      NEO4J_AUTH: "${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-cityGraph2024!}"
+
+      # Memoria
+      NEO4J_server_memory_heap_initial__size: "${NEO4J_HEAP_INITIAL:-512m}"
+      NEO4J_server_memory_heap_max__size:     "${NEO4J_HEAP_MAX:-2g}"
+      NEO4J_server_memory_pagecache_size:     "${NEO4J_PAGECACHE:-1g}"
+
+      # Rete — accetta connessioni da qualsiasi IP (necessario per il container app)
+      NEO4J_server_bolt_listen__address:      "0.0.0.0:7687"
+      NEO4J_server_http_listen__address:      "0.0.0.0:7474"
+
+      # Plugin APOC (utility Cypher avanzate, es. shortestPath pesato)
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+      NEO4J_dbms_security_procedures_allowlist:    "apoc.*"
+
+      # Disabilita telemetria
+      NEO4J_server_jvm_additional: "-Dneo4j.telemetry.enabled=false"
+
+    volumes:
+      # Dati persistenti (sopravvivono a restart/recreate)
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      # Import CSV/JSON per bulk load (opzionale)
+      - neo4j_import:/import
+      # Configurazione custom
+      - ./docker/neo4j/conf:/conf
+      # Plugin extra (JAR) — cartella montata, APOC viene scaricato automaticamente
+      - ./docker/neo4j/plugins:/plugins
+
+    healthcheck:
+      test: ["CMD-SHELL",
+             "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 40s
+
+    networks:
+      - citygraph_net
+
+  # ── APP PYTHON (pipeline headless, senza renderer) ─────────────────────────
+  # Avviata solo con: docker compose --profile app up
+  # Il renderer OpenGL/Pygame NON gira in container (richiede display).
+  # Usare l'app direttamente sull'host per la visualizzazione.
+  app:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: cityGraph_app
+    restart: "no"           # si esegue una volta e termina
+
+    environment:
+      # Punta al container Neo4j sulla rete interna Docker
+      NEO4J_URI:      "bolt://neo4j:7687"
+      NEO4J_USER:     "${NEO4J_USER:-neo4j}"
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD:-cityGraph2024!}"
+      NEO4J_DATABASE: "${NEO4J_DATABASE:-neo4j}"
+      APP_CITY:       "${APP_CITY:-Como, Italy}"
+      APP_FORCE:      "${APP_FORCE_RELOAD:-false}"
+      LOG_LEVEL:      "${LOG_LEVEL:-INFO}"
+      # Headless: disabilita il renderer
+      APP_NO_RENDER:  "true"
+
+    volumes:
+      # Cache OSM condivisa tra host e container
+      - ./data/cache:/app/data/cache
+
+    depends_on:
+      neo4j:
+        condition: service_healthy
+
+    networks:
+      - citygraph_net
+
+# ── VOLUMI ─────────────────────────────────────────────────────────────────────
+volumes:
+  neo4j_data:
+    name: citygraph_neo4j_data
+  neo4j_logs:
+    name: citygraph_neo4j_logs
+  neo4j_import:
+    name: citygraph_neo4j_import
+
+# ── RETE ───────────────────────────────────────────────────────────────────────
+networks:
+  citygraph_net:
+    name: citygraph_net
+    driver: bridge
