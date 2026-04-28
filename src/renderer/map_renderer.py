@@ -1,6 +1,6 @@
 """
-map_renderer.py — Rendering della mappa con Pygame.
-Gestisce: strade, nodi, POI, percorso evidenziato, HUD info.
+map_renderer.py — Rendering della mappa con Pygame (fallback senza OpenGL).
+Gestisce: strade con LOD progressivo, nodi, POI, percorso evidenziato, HUD info.
 """
 
 import logging
@@ -9,7 +9,7 @@ from typing import Optional, List, Dict, Tuple
 import pygame
 import networkx as nx
 
-from config.settings import RENDERER, CAMERA as CAM_CFG
+from config.settings import RENDERER, CAMERA as CAM_CFG, LOD_LEVELS
 from renderer.camera import Camera
 
 log = logging.getLogger(__name__)
@@ -35,8 +35,8 @@ HIGHWAY_COLOR = {
 
 class MapRenderer:
     """
-    Renderer principale del grafo città.
-    Gestisce il loop Pygame, gli eventi, e il disegno.
+    Renderer Pygame del grafo città (fallback senza ModernGL).
+    Supporta LOD progressivo e zoom centrato sul mouse.
     """
 
     def __init__(self, G: nx.DiGraph, pois: List[Dict] = None):
@@ -56,7 +56,6 @@ class MapRenderer:
         self._clock: Optional[pygame.time.Clock] = None
         self._hud_lines: List[str] = []
 
-        # Pre-calcola bbox grafo per fit camera
         lats = [d["lat"] for _, d in G.nodes(data=True) if "lat" in d]
         lons = [d["lon"] for _, d in G.nodes(data=True) if "lon" in d]
         if lats and lons:
@@ -73,12 +72,11 @@ class MapRenderer:
             (RENDERER.window_width, RENDERER.window_height),
             pygame.RESIZABLE,
         )
-        self._clock  = pygame.time.Clock()
-        self._font   = pygame.font.SysFont("Consolas", 14)
+        self._clock   = pygame.time.Clock()
+        self._font    = pygame.font.SysFont("Consolas", 14)
         self._font_sm = pygame.font.SysFont("Consolas", 11)
         self._running = True
-
-        log.info("Renderer avviato. Tasti: Frecce=pan | Scroll=zoom | Click=nodo | R=reset")
+        log.info("MapRenderer (Pygame) avviato.")
 
         while self._running:
             self._handle_events()
@@ -108,6 +106,7 @@ class MapRenderer:
                     self._route_start = None
 
             elif event.type == pygame.MOUSEWHEEL:
+                # Zoom centrato sulla posizione del mouse
                 mx, my = pygame.mouse.get_pos()
                 factor = CAM_CFG.zoom_step if event.y > 0 else 1.0 / CAM_CFG.zoom_step
                 self.camera.zoom_at(mx, my, factor)
@@ -120,7 +119,6 @@ class MapRenderer:
                 self.camera.width  = event.w
                 self.camera.height = event.h
 
-        # Pan con tasti freccia (continuo)
         keys = pygame.key.get_pressed()
         spd  = CAM_CFG.pan_speed
         if keys[pygame.K_LEFT]  or keys[pygame.K_a]: self.camera.pan( spd, 0)
@@ -129,18 +127,14 @@ class MapRenderer:
         if keys[pygame.K_DOWN]  or keys[pygame.K_s]: self.camera.pan(0, -spd)
 
     def _on_left_click(self, pos: Tuple[int, int]) -> None:
-        """Seleziona il nodo più vicino al click, calcola percorso se 2 nodi selezionati."""
-        lon, lat = self.camera.screen_to_world(*pos)
         node = self._find_nearest_screen_node(pos)
         if node is None:
             return
-
         if self._route_start is None:
             self._route_start   = node
             self._selected_node = node
             self._path_nodes    = []
         else:
-            # Calcola percorso
             from graph.algorithms import GraphAlgorithms
             path = GraphAlgorithms.shortest_path(self.G, self._route_start, node)
             if path:
@@ -152,7 +146,6 @@ class MapRenderer:
             self._selected_node = node
 
     def _find_nearest_screen_node(self, pos: Tuple[int, int], threshold: int = 30) -> Optional[int]:
-        """Trova il nodo più vicino al click in pixel."""
         px, py = pos
         best, best_d = None, threshold ** 2
         for nid, data in self.G.nodes(data=True):
@@ -171,14 +164,20 @@ class MapRenderer:
 
     def _update(self) -> None:
         fps  = self._clock.get_fps()
+        zoom = self.camera.zoom
+
+        # Trova label LOD attuale
+        lod_label = LOD_LEVELS[0].label
+        for lod in LOD_LEVELS:
+            if zoom >= lod.zoom_min:
+                lod_label = lod.label
+
         meta = f"Nodi:{self.G.number_of_nodes()} Archi:{self.G.number_of_edges()}"
-        zoom = f"Zoom:{self.camera.zoom:.2f}"
         path_info = f"Percorso:{len(self._path_nodes)} nodi" if self._path_nodes else ""
         sel_info  = f"Sel:{self._route_start}" if self._route_start else ""
         self._hud_lines = [
-            f"FPS:{fps:.0f}  {meta}  {zoom}",
-            "WASD/Frecce=Pan  Scroll=Zoom  Click=Nodo  R=Reset  C=Clear  ESC=Esci",
-            "Click 1°=Partenza  Click 2°=Destinazione → calcola percorso",
+            f"FPS:{fps:.0f}  {meta}  Zoom:{zoom:.2f}  LOD:{lod_label}",
+            "WASD/Frecce=Pan  Scroll=Zoom (centrato sul mouse)  R=Reset  C=Clear  ESC=Esci",
             " | ".join(filter(None, [path_info, sel_info])),
         ]
 
@@ -189,17 +188,16 @@ class MapRenderer:
     def _draw(self) -> None:
         self._screen.fill(RENDERER.bg_color)
         self._draw_grid()
-        #self._draw_edges()
+        self._draw_edges()
         self._draw_path()
-        #if RENDERER.draw_pois:
-            #self._draw_pois()
-        #if RENDERER.draw_nodes:
-            #self._draw_nodes()
+        if RENDERER.draw_pois:
+            self._draw_pois()
+        if RENDERER.draw_nodes:
+            self._draw_nodes()
         self._draw_hud()
         pygame.display.flip()
 
     def _draw_grid(self) -> None:
-        """Griglia di riferimento leggera."""
         surf = self._screen
         W, H = RENDERER.window_width, RENDERER.window_height
         step = 80
@@ -209,13 +207,24 @@ class MapRenderer:
             pygame.draw.line(surf, RENDERER.grid_color, (0, y), (W, y))
 
     def _draw_edges(self) -> None:
-        path_set = set(zip(self._path_nodes, self._path_nodes[1:])) if self._path_nodes else set()
-        cam = self.camera
+        """Disegna solo le strade visibili al LOD corrente."""
+        cam  = self.camera
         surf = self._screen
+        zoom = cam.zoom
+        path_set = set(zip(self._path_nodes, self._path_nodes[1:])) if self._path_nodes else set()
+
+        # Determina quali tipi di highway sono visibili al zoom corrente
+        visible_types: set = set()
+        for lod in LOD_LEVELS:
+            if zoom >= lod.zoom_min:
+                visible_types.update(lod.highway_types)
 
         for u, v, data in self.G.edges(data=True):
+            hw = data.get("highway", "")
+            if hw not in visible_types:
+                continue
             if (u, v) in path_set:
-                continue  # disegnato separatamente
+                continue
             nu = self.G.nodes.get(u, {})
             nv = self.G.nodes.get(v, {})
             if "lat" not in nu or "lat" not in nv:
@@ -224,9 +233,8 @@ class MapRenderer:
             p2 = cam.world_to_screen(nv["lon"], nv["lat"])
             if not cam.is_on_screen(*p1) and not cam.is_on_screen(*p2):
                 continue
-            hw    = data.get("highway", "")
             color = HIGHWAY_COLOR.get(hw, RENDERER.road_color)
-            width = max(1, int(HIGHWAY_WIDTH.get(hw, RENDERER.road_width_base) * cam.zoom * 0.6))
+            width = max(1, int(HIGHWAY_WIDTH.get(hw, RENDERER.road_width_base) * zoom * 0.6))
             pygame.draw.line(surf, color, p1, p2, min(width, 8))
 
     def _draw_path(self) -> None:
@@ -244,6 +252,12 @@ class MapRenderer:
                               max(3, int(4 * cam.zoom * 0.5)))
 
     def _draw_nodes(self) -> None:
+        """
+        Disegna i nodi (punti blu = intersezioni stradali).
+        Visibili solo quando zoom >= RENDERER.node_zoom_min.
+        """
+        if self.camera.zoom < RENDERER.node_zoom_min:
+            return
         cam  = self.camera
         surf = self._screen
         r    = RENDERER.node_radius
@@ -278,7 +292,6 @@ class MapRenderer:
             if not line.strip():
                 continue
             surf_txt = self._font.render(line, True, RENDERER.text_color)
-            # Sfondo semitrasparente
             bg = pygame.Surface((surf_txt.get_width() + 8, surf_txt.get_height() + 4), pygame.SRCALPHA)
             bg.fill((0, 0, 0, 140))
             surf.blit(bg, (4, y - 2))
@@ -296,5 +309,4 @@ class MapRenderer:
             self.camera.fit_to_bbox(min(lons), min(lats), max(lons), max(lats))
 
     def set_path(self, node_ids: List[int]) -> None:
-        """API esterna per evidenziare un percorso."""
         self._path_nodes = node_ids
