@@ -1,21 +1,19 @@
-# Makefile — Scorciatoie per gestire l'intera stack CityGraph
-# Richiede: Docker Desktop, Python 3.12+, make (su Windows: tramite Git Bash o scoop install make)
+# Makefile — CityGraph Explorer + SUMO Simulation
+# Richiede: Docker Desktop, Python 3.12+, SUMO >= 1.20, make (Git Bash su Windows)
 #
 # Comandi principali:
 #   make up          → avvia Neo4j in background
-#   make pipeline    → avvia Neo4j + pipeline Python (headless, nel container)
-#   make run         → avvia l'app con renderer sull'HOST (dopo "make up")
-#   make down        → ferma tutti i container
-#   make logs        → tail log Neo4j
-#   make browser     → apre Neo4j Browser nel browser di default
-#   make status      → stato dei container
-#   make clean       → rimuove container + volumi (ATTENZIONE: cancella il DB)
+#   make pipeline    → Neo4j + pipeline Python headless (container)
+#   make run         → viewer mappa ModernGL (sull'host, Neo4j deve girare)
+#   make simulate    → simulazione SUMO interattiva (sull'host)
+#   make down        → ferma i container
+#   make clean       → rimuove tutto incl. volumi DB
 
-COMPOSE = docker compose
+COMPOSE  = docker compose
 APP_CMD  = python src/main.py
 
-.PHONY: up down pipeline run logs browser status clean reset-db \
-        install shell-neo4j stats help
+.PHONY: up down pipeline run simulate run-force city stats \
+        logs logs-app browser status clean shell-neo4j install help
 
 # ── DOCKER ─────────────────────────────────────────────────────────────────────
 
@@ -26,33 +24,25 @@ up:
 	@echo "✓ Neo4j avviato"
 	@echo "  Browser : http://localhost:7474"
 	@echo "  Bolt    : bolt://localhost:7687"
-	@echo "  User    : neo4j / Password: vedi .env"
 
-## Avvia Neo4j + pipeline Python nel container (headless)
+## Avvia Neo4j + pipeline Python headless nel container
 pipeline:
 	$(COMPOSE) --profile app up --build
-	@echo "✓ Pipeline completata — dati caricati in Neo4j"
 
-## Ferma tutti i container (preserva i volumi/dati)
+## Ferma container (preserva volumi)
 down:
 	$(COMPOSE) down
 
-## Ferma e rimuove TUTTI i volumi (cancella il DB Neo4j!)
+## Ferma e rimuove TUTTO (cancella DB Neo4j!)
 clean:
 	$(COMPOSE) down -v
 	@echo "⚠  Volumi rimossi — Neo4j DB cancellato"
 
-## Ricrea tutto da zero (down + up + pipeline)
-reset-db: clean up
-	@echo "Attendo che Neo4j sia pronto..."
-	sleep 20
-	$(COMPOSE) --profile app up --build
-
-## Stato dei container
+## Stato container
 status:
 	$(COMPOSE) ps
 
-## Log Neo4j in streaming
+## Log Neo4j
 logs:
 	$(COMPOSE) logs -f neo4j
 
@@ -60,53 +50,72 @@ logs:
 logs-app:
 	$(COMPOSE) logs -f app
 
-## Shell interattiva nel container Neo4j
+## Shell Neo4j
 shell-neo4j:
 	docker exec -it citygraph_neo4j bash
-
-# ── APP HOST (renderer OpenGL) ─────────────────────────────────────────────────
-
-## Installa dipendenze Python sull'host
-install:
-	pip install -r requirements.txt
-
-## Avvia l'app completa sull'host (Neo4j deve girare: make up)
-## Carica da Neo4j se i dati ci sono, altrimenti scarica da OSM
-run:
-	$(APP_CMD)
-
-## Forza re-download dei dati OSM e ricarica Neo4j
-run-force:
-	$(APP_CMD) --force
-
-## Cambia città (es: make city CITY="Milano, Italy")
-city:
-	$(APP_CMD) --city "$(CITY)"
-
-## Statistiche grafo (senza renderer)
-stats:
-	$(APP_CMD) --stats
-
-# ── UTILITY ────────────────────────────────────────────────────────────────────
 
 ## Apre Neo4j Browser (Windows)
 browser:
 	start http://localhost:7474
 
-## Help
+# ── APP HOST ───────────────────────────────────────────────────────────────────
+
+## Installa dipendenze Python
+install:
+	pip install -r requirements.txt
+
+## Visualizzatore mappa ModernGL (Neo4j deve girare: make up)
+run:
+	$(APP_CMD)
+
+## Simulazione SUMO interattiva (richiede SUMO_HOME + Neo4j)
+simulate:
+	$(APP_CMD) --simulate
+
+## Re-download forzato OSM + reload Neo4j, poi viewer mappa
+run-force:
+	$(APP_CMD) --force
+
+## Re-download forzato + simulazione SUMO
+simulate-force:
+	$(APP_CMD) --force --simulate
+
+## Carica una città specifica nel viewer mappa
+##   make city CITY="Milano, Italy"
+city:
+	$(APP_CMD) --city "$(CITY)"
+
+## Carica una città specifica in SUMO
+##   make simulate-city CITY="Bergamo, Italy"
+simulate-city:
+	$(APP_CMD) --city "$(CITY)" --simulate
+
+## Statistiche grafo (senza renderer né simulazione)
+stats:
+	$(APP_CMD) --stats
+
+# ── HELP ───────────────────────────────────────────────────────────────────────
+
 help:
 	@echo ""
-	@echo "CityGraph Explorer — Comandi disponibili"
-	@echo "────────────────────────────────────────"
-	@echo "  make up          Avvia Neo4j in background"
-	@echo "  make pipeline    Avvia Neo4j + pipeline Python nel container"
-	@echo "  make run         Avvia app completa sull'host (renderer OpenGL)"
-	@echo "  make run-force   Re-download forzato OSM + reload Neo4j"
-	@echo "  make city CITY=\"Milano, Italy\"   Carica una città specifica"
-	@echo "  make stats       Statistiche grafo"
-	@echo "  make down        Ferma i container"
-	@echo "  make clean       Rimuove container + volumi (CANCELLA DB)"
-	@echo "  make logs        Log Neo4j in streaming"
-	@echo "  make browser     Apre Neo4j Browser nel browser"
-	@echo "  make status      Stato container"
+	@echo "CityGraph Explorer + SUMO — Comandi"
+	@echo "──────────────────────────────────────────────"
+	@echo "  make up                    Avvia Neo4j in background"
+	@echo "  make pipeline              Pipeline headless nel container"
+	@echo "  make run                   Viewer mappa ModernGL"
+	@echo "  make simulate              Simulazione SUMO interattiva"
+	@echo "  make run-force             Re-download + viewer"
+	@echo "  make simulate-force        Re-download + SUMO"
+	@echo "  make city CITY='X, Y'      Viewer per città specifica"
+	@echo "  make simulate-city CITY='X, Y'  SUMO per città specifica"
+	@echo "  make stats                 Statistiche grafo"
+	@echo "  make down                  Ferma container"
+	@echo "  make clean                 Rimuove container + volumi DB (!)"
+	@echo "  make logs                  Log Neo4j in streaming"
+	@echo "  make browser               Apre Neo4j Browser"
+	@echo ""
+	@echo "  Prerequisiti:"
+	@echo "    Docker Desktop   https://www.docker.com/products/docker-desktop"
+	@echo "    SUMO >= 1.20     https://sumo.dlr.de/docs/Downloads.php"
+	@echo "    SUMO_HOME        set SUMO_HOME=C:\\Program Files (x86)\\Eclipse\\Sumo"
 	@echo ""

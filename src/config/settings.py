@@ -104,7 +104,7 @@ class Neo4jConfig:
     user:       str = _env("NEO4J_USER",     "neo4j")
     password:   str = _env("NEO4J_PASSWORD", "cityGraph2024!")
     database:   str = _env("NEO4J_DATABASE", "neo4j")
-    batch_size: int = _env_int("NEO4J_BATCH_SIZE", 2000)
+    batch_size: int = _env_int("NEO4J_BATCH_SIZE", 4000)
 
 NEO4J = Neo4jConfig()
 

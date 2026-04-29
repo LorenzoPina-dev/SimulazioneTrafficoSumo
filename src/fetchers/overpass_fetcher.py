@@ -16,7 +16,6 @@ from fetchers.nominatim_fetcher import NominatimFetcher
 
 log = logging.getLogger(__name__)
 
-# Endpoint pubblici Overpass in ordine di priorità
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
@@ -30,13 +29,18 @@ class OverpassFetcher:
     - Fallback automatico su endpoint alternativi
     - Strategia bbox come fallback alla area-query (più affidabile)
     - Cache locale per evitare richieste ripetute
+
+    Attributo pubblico:
+        last_cache_path — percorso del file JSON in cache dell'ultima richiesta.
+                          Usato da SumoNetExporter per passare i dati grezzi a netconvert.
     """
 
     def __init__(self):
-        self.timeout  = OVERPASS.timeout_seconds
-        self.retries  = OVERPASS.max_retries
-        self.delay    = OVERPASS.retry_delay
-        self._nominatim = NominatimFetcher()
+        self.timeout          = OVERPASS.timeout_seconds
+        self.retries          = OVERPASS.max_retries
+        self.delay            = OVERPASS.retry_delay
+        self.last_cache_path: Optional[str] = None   # ← esposto alla pipeline
+        self._nominatim       = NominatimFetcher()
         os.makedirs(CACHE_DIR, exist_ok=True)
 
     # ──────────────────────────────────────────
@@ -47,19 +51,21 @@ class OverpassFetcher:
         """
         Restituisce dict con chiave 'elements' (lista nodi/vie OSM).
         Usa cache se disponibile e non scaduta.
+        Imposta self.last_cache_path con il percorso del file JSON.
         """
-        # Risolve bbox se non fornita
         bbox = city.bbox
         if bbox is None:
             log.info("Risolvo bbox per '%s' via Nominatim...", city.osm_area_query)
             bbox = self._nominatim.get_city_bbox(city.osm_area_query)
             if bbox:
-                log.info("Bbox: lat %.4f–%.4f  lon %.4f–%.4f", bbox[0], bbox[1], bbox[2], bbox[3])
+                log.info("Bbox: lat %.4f–%.4f  lon %.4f–%.4f",
+                         bbox[0], bbox[1], bbox[2], bbox[3])
             else:
                 log.warning("Bbox non trovata, uso area-query come fallback")
 
-        query = self._build_query(city, bbox)
+        query      = self._build_query(city, bbox)
         cache_path = self._cache_path(query)
+        self.last_cache_path = cache_path   # sempre impostato, esista o meno
 
         if DATA_SOURCES.use_cache and self._cache_valid(cache_path):
             log.info("Cache hit: carico dati OSM da %s", cache_path)
@@ -78,10 +84,6 @@ class OverpassFetcher:
     # ──────────────────────────────────────────
 
     def _build_query(self, city: CityConfig, bbox: Optional[tuple]) -> str:
-        """
-        Preferisce la bbox (più veloce e affidabile).
-        Fallback su area-query per nome se bbox non disponibile.
-        """
         filters = OVERPASS.highway_filters
         timeout = self.timeout
 
@@ -97,7 +99,6 @@ class OverpassFetcher:
 out body;
 """
         else:
-            # Area-query per nome (fallback)
             ways = "\n  ".join(
                 f'way["highway"="{hw}"](area.searchArea);' for hw in filters
             )
@@ -111,22 +112,19 @@ out body;
 """
 
     # ──────────────────────────────────────────
-    # HTTP CON FALLBACK SU ENDPOINT MULTIPLI
+    # HTTP CON FALLBACK
     # ──────────────────────────────────────────
 
     def _execute_with_fallback(self, query: str) -> Dict[str, Any]:
-        """Prova ogni endpoint in sequenza; ritorna al primo successo."""
         last_exc = None
         for endpoint in OVERPASS_ENDPOINTS:
             log.info("Provo endpoint: %s", endpoint)
             try:
-                data = self._execute_query(endpoint, query)
-                return data
+                return self._execute_query(endpoint, query)
             except Exception as exc:
                 log.warning("Endpoint %s fallito: %s", endpoint, exc)
                 last_exc = exc
                 time.sleep(2)
-
         raise RuntimeError(
             f"Tutti gli endpoint Overpass non raggiungibili. Ultimo errore: {last_exc}"
         ) from last_exc
@@ -143,19 +141,18 @@ out body;
                 )
                 resp.raise_for_status()
                 data = resp.json()
-                n = len(data.get("elements", []))
+                n    = len(data.get("elements", []))
                 log.info("Overpass OK: %d elementi da %s", n, endpoint)
                 if n == 0:
-                    raise ValueError("Risposta vuota (0 elementi) — query probabilmente errata")
+                    raise ValueError("Risposta vuota (0 elementi)")
                 return data
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-                log.warning("Tentativo %d/%d timeout/connessione: %s", attempt, self.retries, exc)
+                log.warning("Tentativo %d/%d: %s", attempt, self.retries, exc)
                 if attempt < self.retries:
                     time.sleep(self.delay * attempt)
                 else:
                     raise
             except requests.exceptions.HTTPError as exc:
-                # 504/429: ha senso ritentare; altri errori HTTP: propaga subito
                 code = exc.response.status_code if exc.response is not None else 0
                 if code in (429, 502, 503, 504) and attempt < self.retries:
                     log.warning("HTTP %d, attendo %ds...", code, self.delay * attempt)
@@ -174,8 +171,7 @@ out body;
     def _cache_valid(self, path: str) -> bool:
         if not os.path.exists(path):
             return False
-        age_hours = (time.time() - os.path.getmtime(path)) / 3600
-        return age_hours < DATA_SOURCES.cache_ttl_hours
+        return (time.time() - os.path.getmtime(path)) / 3600 < DATA_SOURCES.cache_ttl_hours
 
     def _load_cache(self, path: str) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:

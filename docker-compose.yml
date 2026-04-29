@@ -33,8 +33,8 @@ services:
 
       # Memoria
       NEO4J_server_memory_heap_initial__size: "${NEO4J_HEAP_INITIAL:-512m}"
-      NEO4J_server_memory_heap_max__size:     "${NEO4J_HEAP_MAX:-2g}"
-      NEO4J_server_memory_pagecache_size:     "${NEO4J_PAGECACHE:-1g}"
+      NEO4J_server_memory_heap_max__size:     "${NEO4J_HEAP_MAX:-4g}"
+      NEO4J_server_memory_pagecache_size:     "${NEO4J_PAGECACHE:-2g}"
 
       # Rete — accetta connessioni da qualsiasi IP (necessario per il container app)
       NEO4J_server_bolt_listen__address:      "0.0.0.0:7687"

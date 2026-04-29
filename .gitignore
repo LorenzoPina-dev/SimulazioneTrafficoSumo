@@ -1,4 +1,4 @@
-# .gitignore — CityGraph Explorer
+# .gitignore — CityGraph Explorer + SUMO
 
 # ── Credenziali e configurazione locale ───────────────────────────────────────
 .env.local
@@ -7,6 +7,9 @@
 # ── Dati generati (grandi, non vanno in git) ──────────────────────────────────
 data/cache/
 data/db/
+data/sumo/*.net.xml
+data/sumo/*.rou.xml
+data/sumo/*.sumocfg
 
 # ── Docker volumi locali (se montati su host) ─────────────────────────────────
 docker/neo4j/data/
@@ -45,3 +48,4 @@ desktop.ini
 *.log
 logs/
 .env
+/src/data

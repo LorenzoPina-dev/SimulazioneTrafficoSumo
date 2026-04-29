@@ -227,6 +227,65 @@ class Neo4jManager:
                 return {"city": rec["city"], "nodes": rec["nodes"], "edges": rec["edges"]}
         return {}
 
+    def load_subgraph_by_bbox(self, lon_min: float, lat_min: float, lon_max: float, lat_max: float) -> nx.DiGraph:
+        """
+        Estrae dal DB il sottografo contenuto nel bounding box fornito.
+        Ritorna un `networkx.DiGraph` con gli stessi attributi dei nodi/archi.
+
+        Parametri: lon_min, lat_min, lon_max, lat_max (gradi decimali)
+        """
+        G = nx.DiGraph()
+        with self._session() as s:
+            # Nodi nel bbox
+            node_q = (
+                "MATCH (n:Intersection) "
+                "WHERE n.lon >= $lon_min AND n.lon <= $lon_max "
+                "  AND n.lat >= $lat_min AND n.lat <= $lat_max "
+                "RETURN n.osmid AS osmid, n.lat AS lat, n.lon AS lon, "
+                "       n.name AS name, n.amenity AS amenity, n.highway AS highway"
+            )
+            params = {"lon_min": lon_min, "lon_max": lon_max, "lat_min": lat_min, "lat_max": lat_max}
+            result = s.run(node_q, **params)
+            nodes_in_bbox = set()
+            for rec in result:
+                osmid = rec["osmid"]
+                nodes_in_bbox.add(osmid)
+                G.add_node(osmid,
+                           lat=rec["lat"], lon=rec["lon"],
+                           name=rec.get("name") or "",
+                           amenity=rec.get("amenity") or "",
+                           highway=rec.get("highway") or "")
+
+            # Archi che hanno entrambi gli endpoint nel bbox
+            edge_q = (
+                "MATCH (a:Intersection)-[r:ROAD]->(b:Intersection) "
+                "WHERE a.lon >= $lon_min AND a.lon <= $lon_max AND a.lat >= $lat_min AND a.lat <= $lat_max "
+                "  AND b.lon >= $lon_min AND b.lon <= $lon_max AND b.lat >= $lat_min AND b.lat <= $lat_max "
+                "RETURN a.osmid AS src, b.osmid AS dst, r.osmid AS osmid, r.highway AS highway, r.name AS name, "
+                "       r.length_m AS length_m, r.weight AS weight, r.oneway AS oneway, r.maxspeed AS maxspeed"
+            )
+            result = s.run(edge_q, **params)
+            for rec in result:
+                src = rec["src"]
+                dst = rec["dst"]
+                # Safety: aggiungi i nodi anche se non presenti (edge case)
+                if src not in G:
+                    G.add_node(src)
+                if dst not in G:
+                    G.add_node(dst)
+                G.add_edge(src, dst,
+                           osmid=rec.get("osmid"),
+                           highway=rec.get("highway") or "",
+                           name=rec.get("name") or "",
+                           length_m=rec.get("length_m") or 0.0,
+                           weight=rec.get("weight") or 0.0,
+                           oneway=bool(rec.get("oneway")),
+                           maxspeed=rec.get("maxspeed"))
+
+        log.info("Sottografo caricato da Neo4j: nodi=%d archi=%d (bbox=[%f,%f,%f,%f])",
+                 G.number_of_nodes(), G.number_of_edges(), lon_min, lat_min, lon_max, lat_max)
+        return G
+
     # ──────────────────────────────────────────
     # POI
     # ──────────────────────────────────────────
