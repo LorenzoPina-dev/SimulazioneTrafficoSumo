@@ -20,7 +20,7 @@ import logging
 import os
 import subprocess
 import xml.etree.ElementTree as ET
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Any
 
 import networkx as nx
 
@@ -71,6 +71,12 @@ class SumoNetExporter:
         self._xy: Dict = {}
         self._net_junction_xy: Dict[str, Tuple[float, float]] = {}
         self._net_edges: List[Dict] = []
+        self._net_lanes: List[Dict[str, Any]] = []
+        self._net_lanes_by_id: Dict[str, Dict[str, Any]] = {}
+        self._net_edges_by_id: Dict[str, Dict[str, Any]] = {}
+        self._net_junctions: List[Dict[str, Any]] = []
+        self._net_junctions_by_id: Dict[str, Dict[str, Any]] = {}
+        self._sign_markers: List[Dict[str, Any]] = []
         self._net_bbox: Optional[Tuple[float, float, float, float]] = None
         self._compute_xy()
 
@@ -225,6 +231,8 @@ class SumoNetExporter:
             "--no-internal-links",
             "--osm.sidewalks",          "false",
             "--osm.crossings",          "false",
+            "--output.street-names",
+            "--output.original-names",
             "--keep-edges.by-vclass",   "passenger,truck,bus,motorcycle,bicycle",
             "--remove-edges.by-vclass", "pedestrian",
             "--no-warnings",
@@ -269,6 +277,12 @@ class SumoNetExporter:
 
             self._net_junction_xy.clear()
             self._net_edges.clear()
+            self._net_lanes.clear()
+            self._net_lanes_by_id.clear()
+            self._net_edges_by_id.clear()
+            self._net_junctions.clear()
+            self._net_junctions_by_id.clear()
+            self._sign_markers.clear()
 
             all_points: List[Tuple[float, float]] = []
 
@@ -278,6 +292,17 @@ class SumoNetExporter:
                 y = float(j.get("y", 0))
                 self._net_junction_xy[jid] = (x, y)
                 all_points.append((x, y))
+                junction = {
+                    "id": jid,
+                    "x": x,
+                    "y": y,
+                    "type": j.get("type", "") or "",
+                    "inc_lanes": [lane_id for lane_id in (j.get("incLanes", "") or "").split() if lane_id],
+                    "shape": self._parse_shape_points(j.get("shape", "") or ""),
+                    "request_count": len(j.findall("request")),
+                }
+                self._net_junctions.append(junction)
+                self._net_junctions_by_id[jid] = junction
                 try:
                     nid = int(jid)
                     if nid in self._xy:
@@ -296,20 +321,55 @@ class SumoNetExporter:
                 if hw.startswith("highway."):
                     hw = hw.split(".", 1)[1]
 
+                name = edge.get("name", "") or ""
+                ref = ""
+                for param in edge.findall("param"):
+                    key = param.get("key", "") or ""
+                    if key in ("ref", "origId") and not ref:
+                        ref = param.get("value", "") or ""
+                    if key in ("name", "origName") and not name:
+                        name = param.get("value", "") or ""
+
                 points = self._parse_shape_points(edge.get("shape", "") or "")
-                if len(points) < 2:
-                    for lane in edge.findall("lane"):
-                        points = self._parse_shape_points(lane.get("shape", "") or "")
-                        if len(points) >= 2:
-                            break
+                lanes_data: List[Dict[str, Any]] = []
+                for lane in edge.findall("lane"):
+                    lane_shape = self._parse_shape_points(lane.get("shape", "") or "")
+                    if len(lane_shape) < 2:
+                        continue
+                    lane_width = float(lane.get("width", 3.2) or 3.2)
+                    lane_data = {
+                        "id": lane.get("id", "") or "",
+                        "edge_id": edge_id,
+                        "index": int(lane.get("index", 0) or 0),
+                        "width": lane_width,
+                        "shape": lane_shape,
+                        "speed": float(lane.get("speed", 0) or 0),
+                        "length": float(lane.get("length", 0) or 0),
+                        "allow": lane.get("allow", "") or "",
+                        "disallow": lane.get("disallow", "") or "",
+                    }
+                    lanes_data.append(lane_data)
+                    self._net_lanes.append(lane_data)
+                    self._net_lanes_by_id[lane_data["id"]] = lane_data
+                    all_points.extend(lane_shape)
+
+                if len(points) < 2 and lanes_data:
+                    points = lanes_data[0]["shape"]
                 if len(points) < 2:
                     continue
 
-                self._net_edges.append({
+                edge_data = {
                     "id": edge_id,
                     "hw": hw,
+                    "name": name,
+                    "ref": ref,
                     "shape": points,
-                })
+                    "lanes": lanes_data,
+                    "spread_type": edge.get("spreadType", "") or "",
+                    "priority": int(edge.get("priority", 0) or 0),
+                }
+                self._net_edges.append(edge_data)
+                self._net_edges_by_id[edge_id] = edge_data
                 all_points.extend(points)
 
             if all_points:
@@ -319,13 +379,36 @@ class SumoNetExporter:
             else:
                 self._net_bbox = None
 
-            log.info("Geometria SUMO caricata: %d junction, %d edge",
-                     len(self._net_junction_xy), len(self._net_edges))
+            self._collect_sign_markers()
+
+            log.info("Geometria SUMO caricata: %d junction, %d edge, %d lane",
+                     len(self._net_junction_xy), len(self._net_edges), len(self._net_lanes))
         except Exception as exc:
             log.warning("_load_net_geometry fallito: %s", exc)
             self._net_junction_xy.clear()
             self._net_edges.clear()
+            self._net_lanes.clear()
+            self._net_lanes_by_id.clear()
+            self._net_edges_by_id.clear()
+            self._net_junctions.clear()
+            self._net_junctions_by_id.clear()
+            self._sign_markers.clear()
             self._net_bbox = None
+
+    def _collect_sign_markers(self) -> None:
+        for nid, data in self.G.nodes(data=True):
+            sign_kind = (data.get("highway", "") or "").strip()
+            if sign_kind not in {"stop", "give_way"}:
+                continue
+            xy = self._xy.get(nid)
+            if not xy:
+                continue
+            self._sign_markers.append({
+                "id": str(nid),
+                "kind": sign_kind,
+                "x": xy[0],
+                "y": xy[1],
+            })
 
     # ──────────────────────────────────────────
     # GENERATORE INTERNO FALLBACK
@@ -398,6 +481,7 @@ class SumoNetExporter:
             ee = ET.SubElement(root, "edge",
                                id=eid, **{"from": str(u), "to": str(v)},
                                type=f"highway.{hw}",
+                               name=str(data.get("name", "") or ""),
                                priority="1", numLanes="1",
                                speed=f"{spd:.4f}",
                                length=f"{ln:.4f}",
@@ -485,6 +569,21 @@ class SumoNetExporter:
 
     def get_draw_edges(self) -> List[Dict]:
         return list(self._net_edges)
+
+    def get_draw_lanes(self) -> List[Dict[str, Any]]:
+        return list(self._net_lanes)
+
+    def get_lane(self, lane_id: str) -> Optional[Dict[str, Any]]:
+        return self._net_lanes_by_id.get(lane_id)
+
+    def get_junctions(self) -> List[Dict[str, Any]]:
+        return list(self._net_junctions)
+
+    def get_junction(self, junction_id: str) -> Optional[Dict[str, Any]]:
+        return self._net_junctions_by_id.get(junction_id)
+
+    def get_sign_markers(self) -> List[Dict[str, Any]]:
+        return list(self._sign_markers)
 
     def nearest_edge(self, x: float, y: float
                      ) -> Optional[Tuple[str, float, float]]:

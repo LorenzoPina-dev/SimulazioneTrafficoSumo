@@ -291,13 +291,65 @@ class SimulationController:
                     x, y  = self._traci.vehicle.getPosition(vid)
                     speed = self._traci.vehicle.getSpeed(vid)
                     vt    = self._traci.vehicle.getTypeID(vid)
+                    angle = self._traci.vehicle.getAngle(vid)
+                    length = self._traci.vehicle.getLength(vid)
+                    width = self._traci.vehicle.getWidth(vid)
+                    road_id = self._traci.vehicle.getRoadID(vid)
                     out.append({"id": vid, "x": x, "y": y,
-                                "speed": speed, "type": vt})
+                                "speed": speed, "type": vt,
+                                "angle": angle, "length": length,
+                                "width": width, "road_id": road_id})
                 except Exception:
                     pass
         except Exception:
             pass
         return out
+
+    def get_signal_states(self) -> List[Dict]:
+        if not self._running:
+            return []
+        out: List[Dict] = []
+        try:
+            for tl_id in self._traci.trafficlight.getIDList():
+                try:
+                    state = self._traci.trafficlight.getRedYellowGreenState(tl_id)
+                    lanes = self._traci.trafficlight.getControlledLanes(tl_id)
+                    phase = self._traci.trafficlight.getPhase(tl_id)
+                    next_switch = self._traci.trafficlight.getNextSwitch(tl_id)
+                except Exception as exc:
+                    log.debug("Lettura semaforo %s fallita: %s", tl_id, exc)
+                    continue
+
+                lane_states: Dict[str, str] = {}
+                limit = min(len(state), len(lanes))
+                for idx in range(limit):
+                    lane_id = lanes[idx]
+                    if not lane_id:
+                        continue
+                    lamp = state[idx]
+                    current = lane_states.get(lane_id)
+                    if current is None or self._signal_rank(lamp) > self._signal_rank(current):
+                        lane_states[lane_id] = lamp
+
+                out.append({
+                    "id": tl_id,
+                    "phase": phase,
+                    "next_switch": next_switch,
+                    "state": state,
+                    "lane_states": lane_states,
+                })
+        except Exception:
+            return []
+        return out
+
+    @staticmethod
+    def _signal_rank(state_char: str) -> int:
+        c = (state_char or "r")[0]
+        if c in ("G", "g"):
+            return 3
+        if c in ("Y", "y", "u"):
+            return 2
+        return 1
 
     def get_stats(self) -> Dict:
         if not self._running:
