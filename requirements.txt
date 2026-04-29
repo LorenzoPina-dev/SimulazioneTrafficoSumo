@@ -4,6 +4,7 @@ requests>=2.31.0
 neo4j>=5.19.0
 moderngl>=5.10.0
 numpy>=1.26.0
+Pillow>=10.0.0
 
 # sumolib e libsumo vengono da SUMO_HOME/tools — non si installano via pip.
 # Assicurarsi di avere SUMO >= 1.20 installato e SUMO_HOME impostato.

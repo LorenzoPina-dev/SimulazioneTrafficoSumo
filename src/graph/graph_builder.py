@@ -1,184 +1,153 @@
-"""
-graph_builder.py — Converte i dati OSM grezzi in un grafo NetworkX.
-"""
-
 import math
 import logging
-from typing import Dict, Any, List, Optional, Tuple
-
 import networkx as nx
-
-from config.settings import GRAPH, OVERPASS
+from typing import Dict, Any, List, Tuple
 
 log = logging.getLogger(__name__)
 
-
-# ─────────────────────────────────────────────
-# COSTANTI GEOGRAFICHE
-# ─────────────────────────────────────────────
-EARTH_RADIUS_M = 6_371_000  # metri
-
-
-def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Distanza in metri tra due coordinate geografiche."""
-    r = EARTH_RADIUS_M
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi  = math.radians(lat2 - lat1)
-    dlam  = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(a))
-
+PRIORITY_MAP = {
+    'motorway': 10, 'trunk': 9, 'primary': 8, 'secondary': 7,
+    'tertiary': 6, 'residential': 4, 'living_street': 3, 'service': 2, 'unclassified': 2
+}
 
 class GraphBuilder:
-    """
-    Trasforma gli elementi JSON di Overpass in un grafo NetworkX.
-
-    Nodi  → osmid, lat, lon, (+ metadati opzionali)
-    Archi → osmid, highway, name, length_m, oneway, maxspeed, ...
-    """
+    def __init__(self):
+        self.directed = True 
 
     def build(self, osm_data: Dict[str, Any]) -> nx.DiGraph:
-        """
-        Punto di ingresso principale.
-        Restituisce un DiGraph (diretto) o Graph (non diretto) secondo la config.
-        """
         elements = osm_data.get("elements", [])
-
         nodes_raw, ways = self._separate_elements(elements)
+        
+        # 1. Conta quante vie passano per ogni nodo
+        node_usage = self._count_node_usage(ways)
+        
+        G = nx.DiGraph()
+        
+        # 2. Identifica i nodi che sono "VERI" incroci
+        # Un nodo è un vero incrocio se:
+        # - È l'inizio o la fine di una via
+        # - È usato da 2 o più vie diverse
+        # - Ha tag speciali (stop, semaforo)
+        self._add_essential_nodes(G, nodes_raw, node_usage, ways)
+        
+        # 3. Collega i nodi essenziali creando archi "collassati"
+        # Questo trasforma i nodi intermedi in semplici segmenti di un unico arco
+        self._add_collapsed_edges(G, ways, nodes_raw)
 
-        log.info("OSM: %d nodi, %d ways", len(nodes_raw), len(ways))
-
-        G = nx.DiGraph() if GRAPH.directed else nx.Graph()
-        self._add_nodes(G, nodes_raw)
-        self._add_edges(G, ways, nodes_raw)
-
-        if GRAPH.simplify:
-            G = self._simplify_graph(G)
-            log.info("Grafo semplificato: %d nodi, %d archi", G.number_of_nodes(), G.number_of_edges())
-        else:
-            log.info("Grafo: %d nodi, %d archi", G.number_of_nodes(), G.number_of_edges())
-
+        log.info("Grafo Ottimizzato: %d nodi (incroci reali), %d archi", G.number_of_nodes(), G.number_of_edges())
         return G
 
-    # ──────────────────────────────────────────
-    # PARSING ELEMENTI OSM
-    # ──────────────────────────────────────────
-
-    @staticmethod
-    def _separate_elements(elements: List[Dict]) -> Tuple[Dict, List[Dict]]:
-        nodes = {}
-        ways  = []
-        for el in elements:
-            t = el.get("type")
-            if t == "node":
-                nodes[el["id"]] = el
-            elif t == "way":
-                ways.append(el)
+    def _separate_elements(self, elements: List[Dict]) -> Tuple[Dict, List[Dict]]:
+        nodes = {el["id"]: el for el in elements if el["type"] == "node"}
+        ways = [el for el in elements if el["type"] == "way" and "tags" in el]
         return nodes, ways
 
-    # ──────────────────────────────────────────
-    # AGGIUNTA NODI
-    # ──────────────────────────────────────────
-
-    @staticmethod
-    def _add_nodes(G: nx.DiGraph, nodes_raw: Dict) -> None:
-        for nid, n in nodes_raw.items():
-            tags = n.get("tags", {})
-            G.add_node(
-                nid,
-                lat=n["lat"],
-                lon=n["lon"],
-                name=tags.get("name", ""),
-                amenity=tags.get("amenity", ""),
-                highway=tags.get("highway", ""),
-            )
-
-    # ──────────────────────────────────────────
-    # AGGIUNTA ARCHI
-    # ──────────────────────────────────────────
-
-    def _add_edges(self, G: nx.DiGraph, ways: List[Dict], nodes_raw: Dict) -> None:
+    def _count_node_usage(self, ways: List[Dict]) -> Dict[int, int]:
+        counts = {}
         for way in ways:
-            tags   = way.get("tags", {})
-            refs   = way.get("nodes", [])
-            hw     = tags.get("highway", "")
-            name   = tags.get("name", "")
-            oneway = self._parse_oneway(tags)
-            maxspeed = self._parse_maxspeed(tags)
+            for node_id in way.get("nodes", []):
+                counts[node_id] = counts.get(node_id, 0) + 1
+        return counts
 
-            # Filtra highway non desiderati
-            if hw not in OVERPASS.highway_filters:
-                continue
+    def _add_essential_nodes(self, G: nx.DiGraph, nodes_raw: Dict, node_usage: Dict, ways: List[Dict]):
+        essential_ids = set()
+        for way in ways:
+            nodes = way.get("nodes", [])
+            if not nodes: continue
+            
+            # Estremi della via sono sempre nodi nel grafo
+            essential_ids.add(nodes[0])
+            essential_ids.add(nodes[-1])
+            
+            for nid in nodes:
+                # Se il nodo è un incrocio tra vie diverse, è essenziale
+                if node_usage.get(nid, 0) > 1:
+                    essential_ids.add(nid)
+                # Se il nodo ha tag di controllo traffico, è essenziale
+                if nid in nodes_raw and "tags" in nodes_raw[nid]:
+                    t = nodes_raw[nid]["tags"]
+                    if any(k in t for k in ["highway", "amenity", "junction"]):
+                        if t.get("highway") in ["stop", "traffic_signals", "give_way"]:
+                            essential_ids.add(nid)
 
-            for i in range(len(refs) - 1):
-                u, v = refs[i], refs[i + 1]
-                if u not in nodes_raw or v not in nodes_raw:
-                    continue
-
-                nu, nv = nodes_raw[u], nodes_raw[v]
-                dist = haversine(nu["lat"], nu["lon"], nv["lat"], nv["lon"])
-
-                edge_attrs = dict(
-                    osmid=way["id"],
-                    highway=hw,
-                    name=name,
-                    length_m=round(dist, 2),
-                    weight=round(dist, 2),   # usato dagli algoritmi
-                    oneway=oneway,
-                    maxspeed=maxspeed,
+        for nid in essential_ids:
+            if nid in nodes_raw:
+                n = nodes_raw[nid]
+                tags = n.get("tags", {})
+                G.add_node(
+                    nid,
+                    lat=n["lat"], lon=n["lon"],
+                    osmid=nid,
+                    node_type=self._guess_node_type(tags)
                 )
 
-                G.add_edge(u, v, **edge_attrs)
-                if not oneway and GRAPH.directed:
-                    G.add_edge(v, u, **edge_attrs)
+    def _guess_node_type(self, tags: Dict) -> str:
+        hw = tags.get("highway", "")
+        if hw == "traffic_signals": return "traffic_light"
+        if hw == "stop": return "priority_stop"
+        return "priority"
 
-    # ──────────────────────────────────────────
-    # SEMPLIFICAZIONE
-    # ──────────────────────────────────────────
+    def _add_collapsed_edges(self, G: nx.DiGraph, ways: List[Dict], nodes_raw: Dict):
+        """Crea archi diretti tra i nodi essenziali, ignorando i nodi intermedi."""
+        for way in ways:
+            tags = way.get("tags", {})
+            hw = tags.get("highway", "residential")
+            
+            is_roundabout = tags.get("junction") == "roundabout" or tags.get("highway") == "roundabout"
+            oneway_tag = str(tags.get("oneway", "no")).lower()
+            is_oneway = is_roundabout or oneway_tag in ("yes", "true", "1", "-1")
+            
+            priority = PRIORITY_MAP.get(hw, 2)
+            if is_roundabout: priority += 2
+
+            nodes = way.get("nodes", [])
+            if len(nodes) < 2: continue
+
+            # Partiamo dal primo nodo della via
+            start_node = nodes[0]
+            accumulated_dist = 0
+
+            for i in range(1, len(nodes)):
+                u_id, v_id = nodes[i-1], nodes[i]
+                if u_id not in nodes_raw or v_id not in nodes_raw: continue
+                
+                accumulated_dist += self._haversine(nodes_raw[u_id], nodes_raw[v_id])
+
+                # Se il nodo corrente è un nodo "ESSENZIALE" (incrocio reale), chiudiamo l'arco
+                if v_id in G.nodes:
+                    edge_attrs = {
+                        "osmid": way["id"],
+                        "priority": priority,
+                        "length_m": round(accumulated_dist, 2),
+                        "speed_kmh": self._parse_maxspeed(tags),
+                        "allow_uturn": False,
+                        "junction": "roundabout" if is_roundabout else "",
+                        "oneway": True
+                    }
+
+                    # Direzione di marcia
+                    if oneway_tag == "-1":
+                        G.add_edge(v_id, start_node, **edge_attrs)
+                    else:
+                        G.add_edge(start_node, v_id, **edge_attrs)
+                        if not is_oneway:
+                            G.add_edge(v_id, start_node, **edge_attrs)
+
+                    # Reset per il prossimo segmento tra incroci
+                    start_node = v_id
+                    accumulated_dist = 0
 
     @staticmethod
-    def _simplify_graph(G: nx.DiGraph) -> nx.DiGraph:
-        """
-        Rimuove nodi di passaggio (grado = 2, un solo arco in/out)
-        collegando direttamente i nodi terminali.
-        Conserva i nodi alle intersezioni e ai capolinea.
-        """
-        to_remove = []
-        for node in list(G.nodes):
-            preds = list(G.predecessors(node))
-            succs = list(G.successors(node))
-            # Nodo intermedio: 1 predecessore, 1 successore, diversi
-            if len(preds) == 1 and len(succs) == 1 and preds[0] != succs[0]:
-                p, s = preds[0], succs[0]
-                ep  = G[p][node]
-                es  = G[node][s]
-                new_len = ep.get("length_m", 0) + es.get("length_m", 0)
-                merged = dict(ep)
-                merged["length_m"] = round(new_len, 2)
-                merged["weight"]   = round(new_len, 2)
-                G.add_edge(p, s, **merged)
-                if not ep.get("oneway") and isinstance(G, nx.DiGraph):
-                    G.add_edge(s, p, **merged)
-                to_remove.append(node)
-
-        G.remove_nodes_from(to_remove)
-        return G
-
-    # ──────────────────────────────────────────
-    # HELPER PARSING TAG OSM
-    # ──────────────────────────────────────────
+    def _haversine(n1: Dict, n2: Dict) -> float:
+        R = 6371000
+        phi1, phi2 = math.radians(n1["lat"]), math.radians(n2["lat"])
+        dphi = math.radians(n2["lat"] - n1["lat"])
+        dlam = math.radians(n2["lon"] - n1["lon"])
+        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+        return 2 * R * math.asin(math.sqrt(a))
 
     @staticmethod
-    def _parse_oneway(tags: Dict) -> bool:
-        v = tags.get("oneway", "no").lower()
-        return v in ("yes", "true", "1", "-1")
-
-    @staticmethod
-    def _parse_maxspeed(tags: Dict) -> Optional[int]:
-        raw = tags.get("maxspeed", "")
-        if not raw:
-            return None
-        try:
-            return int(raw.split()[0])
-        except (ValueError, IndexError):
-            return None
+    def _parse_maxspeed(tags: Dict) -> int:
+        raw = tags.get("maxspeed", "50")
+        try: return int(raw.split()[0])
+        except: return 50

@@ -11,10 +11,16 @@ Obiettivi della vista:
 import math
 import os
 import logging
+from datetime import datetime
 from typing import Optional, List, Dict, Tuple, Any
 
 import pygame
 import networkx as nx
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 from sumo.net_exporter import SumoNetExporter
 from sumo.scenario_builder import ScenarioBuilder, VEHICLE_TYPES
@@ -181,11 +187,17 @@ ZOOM_MAX = 120.0
 
 LANE_ARROW_ZOOM_MIN = 1.05
 LANE_BORDER_ZOOM_MIN = 1.55
+JUNCTION_LAYER_ZOOM_MIN = 0.14
+JUNCTION_BORDER_ZOOM_MIN = 0.9
 ROAD_LABEL_ZOOM_MIN = 0.7
 SIGN_ZOOM_MIN = 1.45
 SIGN_TEXT_ZOOM_MIN = 2.2
 SIGNAL_ZOOM_MIN = 1.0
 VEHICLE_DETAIL_ZOOM_MIN = 0.6
+GIF_CAPTURE_EVERY = 6
+GIF_MAX_CAPTURED_FRAMES = 120
+GIF_MAX_WIDTH = 720
+GIF_FRAME_MS = 100
 
 
 def _road_style(hw: str) -> Dict[str, Any]:
@@ -223,6 +235,38 @@ def _point_and_angle_at_distance(points: List[Tuple[float, float]],
 
     a, b = points[-2], points[-1]
     return b, math.degrees(math.atan2(b[1] - a[1], b[0] - a[0]))
+
+
+def _blend_color(base: Tuple[int, int, int], other: Tuple[int, int, int],
+                 ratio: float) -> Tuple[int, int, int]:
+    ratio = max(0.0, min(1.0, ratio))
+    return tuple(
+        int(round(a + (b - a) * ratio))
+        for a, b in zip(base, other)
+    )
+
+
+def _clean_polygon(points: List[Tuple[float, float]], epsilon: float = 0.05
+                   ) -> List[Tuple[float, float]]:
+    cleaned: List[Tuple[float, float]] = []
+    for x, y in points:
+        if cleaned and math.hypot(x - cleaned[-1][0], y - cleaned[-1][1]) <= epsilon:
+            continue
+        cleaned.append((x, y))
+    if len(cleaned) >= 2 and math.hypot(cleaned[0][0] - cleaned[-1][0],
+                                        cleaned[0][1] - cleaned[-1][1]) <= epsilon:
+        cleaned.pop()
+    return cleaned
+
+
+def _polygon_area(points: List[Tuple[float, float]]) -> float:
+    if len(points) < 3:
+        return 0.0
+    total = 0.0
+    pts = list(points) + [points[0]]
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+        total += x1 * y2 - x2 * y1
+    return abs(total) * 0.5
 
 
 def _upright_angle(angle_deg: float) -> float:
@@ -317,6 +361,8 @@ class SumoRenderer:
         self.G = G
         self.data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
+        self._gif_dir = os.path.join(os.path.dirname(self.data_dir), "gifs")
+        os.makedirs(self._gif_dir, exist_ok=True)
 
         self._window_w = INITIAL_WINDOW_W
         self._window_h = INITIAL_WINDOW_H
@@ -338,13 +384,17 @@ class SumoRenderer:
         self.exporter = SumoNetExporter(G, osm_cache_path=osm_cache_path)
         self.net_path = os.path.join(data_dir, "city.net.xml")
         self.exporter.export(self.net_path)
+        self._draw_edges = self.exporter.get_draw_edges()
+        self._edge_by_id = {edge["id"]: edge for edge in self._draw_edges}
 
         self._lane_draw_list = self._precompute_lane_draw_list()
+        self._junction_draw_list = self._precompute_junction_draw_list()
         self._road_label_list = self._precompute_road_labels()
         self._junctions = self.exporter.get_junctions()
         self._sign_markers = self.exporter.get_sign_markers()
-        log.info("Renderer SUMO: %d lane, %d edge label, %d marker STOP/YIELD",
-                 len(self._lane_draw_list), len(self._road_label_list), len(self._sign_markers))
+        log.info("Renderer SUMO: %d lane, %d junction draw, %d edge label, %d marker STOP/YIELD",
+                 len(self._lane_draw_list), len(self._junction_draw_list),
+                 len(self._road_label_list), len(self._sign_markers))
 
         bounds = self.exporter.get_bounds()
         if not bounds:
@@ -369,15 +419,15 @@ class SumoRenderer:
         self._stats: Dict[str, Any] = {}
         self._log_lines: List[str] = []
         self._bg: Optional[pygame.Surface] = None
+        self._gif_recording: Optional[Dict[str, Any]] = None
 
         self._build_buttons()
 
     def _precompute_lane_draw_list(self) -> List[Dict[str, Any]]:
-        edge_by_id = {edge["id"]: edge for edge in self.exporter.get_draw_edges()}
         lanes: List[Dict[str, Any]] = []
 
         for lane in self.exporter.get_draw_lanes():
-            edge = edge_by_id.get(lane["edge_id"])
+            edge = self._edge_by_id.get(lane["edge_id"])
             if not edge:
                 continue
             hw = edge.get("hw", "") or ""
@@ -402,9 +452,52 @@ class SumoRenderer:
         lanes.sort(key=lambda item: item["rank"])
         return lanes
 
+    def _precompute_junction_draw_list(self) -> List[Dict[str, Any]]:
+        junctions: List[Dict[str, Any]] = []
+
+        for junction in self.exporter.get_junctions():
+            inc_lanes = junction.get("inc_lanes", []) or []
+            lane_styles: List[Dict[str, Any]] = []
+            lane_widths: List[float] = []
+
+            for lane_id in inc_lanes:
+                lane = self.exporter.get_lane(lane_id)
+                if not lane:
+                    continue
+                edge = self._edge_by_id.get(lane.get("edge_id", ""))
+                if not edge:
+                    continue
+                lane_styles.append(_road_style(edge.get("hw", "") or ""))
+                lane_widths.append(float(lane.get("width", 3.2) or 3.2))
+
+            style = max(lane_styles, key=lambda item: item["rank"]) if lane_styles else DEFAULT_ROAD_STYLE
+            poly = _clean_polygon(junction.get("shape", []) or [])
+            area_m2 = _polygon_area(poly)
+            fallback_half_m = max(2.4, min(9.0, max(lane_widths, default=3.2) * 0.9))
+            if len(inc_lanes) >= 4:
+                fallback_half_m *= 1.18
+            elif len(inc_lanes) <= 1:
+                fallback_half_m *= 0.8
+
+            junctions.append({
+                "id": junction["id"],
+                "x": junction["x"],
+                "y": junction["y"],
+                "type": junction.get("type", "") or "",
+                "shape": poly,
+                "area_m2": area_m2,
+                "fallback_half_m": fallback_half_m,
+                "fill": _blend_color(style["fill"], MAP_BG, 0.08),
+                "border": _blend_color(style["casing"], TEXT_DARK, 0.18),
+                "lane_count": len(inc_lanes),
+                "mode": "poly" if len(poly) >= 3 and area_m2 >= 1.0 else "square",
+            })
+
+        return junctions
+
     def _precompute_road_labels(self) -> List[Dict[str, Any]]:
         labels: List[Dict[str, Any]] = []
-        for edge in self.exporter.get_draw_edges():
+        for edge in self._draw_edges:
             label = edge.get("name", "") or edge.get("ref", "") or ""
             if not label:
                 continue
@@ -503,6 +596,7 @@ class SumoRenderer:
                 self._build_background()
 
             self._draw()
+            self._update_gif_recording()
             pygame.display.flip()
             self._clock.tick(60)
 
@@ -582,6 +676,7 @@ class SumoRenderer:
     def _stop_simulation(self) -> None:
         if not self._sim_running:
             return
+        self._finish_gif_recording("interrotta")
         if self.sim:
             self.sim.stop()
         if self.scenario:
@@ -609,6 +704,103 @@ class SumoRenderer:
             return
         created = self.sim.spawn_random(self._spawn_count, self._veh_type)
         self._log(f"Spawned {len(created)}/{self._spawn_count} random")
+        if created:
+            self._start_gif_recording(created)
+
+    def _start_gif_recording(self, vehicle_ids: List[str]) -> None:
+        if Image is None:
+            self._log("GIF non disponibile: installa Pillow.")
+            return
+
+        if self._gif_recording:
+            self._finish_gif_recording("chiusa per nuova cattura")
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_type = "".join(ch for ch in self._veh_type if ch.isalnum() or ch in ("-", "_")) or "vehicle"
+        file_name = f"sim_{stamp}_{safe_type}_{len(vehicle_ids)}.gif"
+        self._gif_recording = {
+            "tracked_ids": set(vehicle_ids),
+            "seen_vehicle": False,
+            "tick": 0,
+            "frames": [],
+            "frame_size": None,
+            "file_path": os.path.join(self._gif_dir, file_name),
+        }
+        self._log(f"GIF recording avviata: {file_name}")
+
+    def _update_gif_recording(self) -> None:
+        rec = self._gif_recording
+        if not rec or not self._sim_running or self._paused or Image is None:
+            return
+
+        active_ids = {vehicle["id"] for vehicle in self._vehicles}
+        tracked_alive = rec["tracked_ids"] & active_ids
+        if tracked_alive:
+            rec["seen_vehicle"] = True
+        elif rec["seen_vehicle"]:
+            self._finish_gif_recording("completata")
+            return
+        else:
+            return
+
+        rec["tick"] += 1
+        if rec["tick"] % GIF_CAPTURE_EVERY != 0:
+            return
+
+        map_rect = pygame.Rect(0, 0, self._map_w, self._window_h)
+        frame_surface = self._screen.subsurface(map_rect).copy()
+        frame = Image.frombytes(
+            "RGB",
+            frame_surface.get_size(),
+            pygame.image.tostring(frame_surface, "RGB"),
+        )
+
+        if frame.width > GIF_MAX_WIDTH:
+            scale = GIF_MAX_WIDTH / float(frame.width)
+            target_h = max(1, int(frame.height * scale))
+            frame = frame.resize((GIF_MAX_WIDTH, target_h), Image.Resampling.LANCZOS)
+
+        if rec["frame_size"] is None:
+            rec["frame_size"] = frame.size
+        elif frame.size != rec["frame_size"]:
+            frame = frame.resize(rec["frame_size"], Image.Resampling.LANCZOS)
+
+        rec["frames"].append(frame)
+        if len(rec["frames"]) >= GIF_MAX_CAPTURED_FRAMES:
+            self._finish_gif_recording("raggiunto limite frame")
+
+    def _finish_gif_recording(self, note: str = "completata") -> None:
+        rec = self._gif_recording
+        if not rec:
+            return
+        self._gif_recording = None
+
+        frames = rec["frames"]
+        if not frames:
+            self._log(f"GIF annullata ({note}): nessun frame catturato")
+            return
+
+        first, *rest = frames
+        try:
+            first.save(
+                rec["file_path"],
+                save_all=True,
+                append_images=rest,
+                duration=GIF_FRAME_MS,
+                loop=0,
+                optimize=False,
+                disposal=2,
+            )
+            self._log(f"GIF salvata: {os.path.basename(rec['file_path'])} ({note})")
+        except Exception as exc:
+            log.error("Salvataggio GIF fallito: %s", exc, exc_info=True)
+            self._log(f"Errore salvataggio GIF: {exc}")
+        finally:
+            for frame in frames:
+                try:
+                    frame.close()
+                except Exception:
+                    pass
 
     def _fit_camera(self) -> None:
         span_x = self._sumo_xmax - self._sumo_xmin
@@ -654,6 +846,7 @@ class SumoRenderer:
         surf.fill(MAP_BG)
         self._draw_map_backdrop(surf)
         self._draw_lane_layer(surf)
+        self._draw_junction_layer(surf)
         self._draw_static_signal_hubs(surf)
         self._draw_road_labels(surf)
         self._draw_sign_markers(surf)
@@ -695,6 +888,34 @@ class SumoRenderer:
 
             if zoom >= LANE_ARROW_ZOOM_MIN and width_px >= 4 and lane["vehicular"]:
                 self._draw_lane_arrows(surf, pts, width_px)
+
+    def _draw_junction_layer(self, surf: pygame.Surface) -> None:
+        zoom = self._cam_zoom
+        if zoom < JUNCTION_LAYER_ZOOM_MIN:
+            return
+
+        for junction in self._junction_draw_list:
+            if junction["mode"] == "poly":
+                if zoom < 0.32 and junction["area_m2"] < 18.0:
+                    continue
+                pts = [self._sumo_to_screen(x, y) for x, y in junction["shape"]]
+                if len(pts) < 3 or not any(self._on_map(px, py, 32) for px, py in pts):
+                    continue
+                pygame.draw.polygon(surf, junction["fill"], pts)
+                if zoom >= JUNCTION_BORDER_ZOOM_MIN:
+                    pygame.draw.polygon(surf, junction["border"], pts, 1)
+                continue
+
+            px, py = self._sumo_to_screen(junction["x"], junction["y"])
+            half_px = max(2, min(15, int(round(junction["fallback_half_m"] * zoom))))
+            if half_px < 3 and zoom < 0.38:
+                continue
+            if not self._on_map(px, py, half_px + 16):
+                continue
+            rect = pygame.Rect(px - half_px, py - half_px, half_px * 2, half_px * 2)
+            pygame.draw.rect(surf, junction["fill"], rect, border_radius=2)
+            if zoom >= JUNCTION_BORDER_ZOOM_MIN and half_px >= 4:
+                pygame.draw.rect(surf, junction["border"], rect, 1, border_radius=2)
 
     def _draw_lane_arrows(self, surf: pygame.Surface,
                           pts: List[Tuple[int, int]], width_px: int) -> None:
@@ -946,6 +1167,8 @@ class SumoRenderer:
                 f"Segnali   : {len(self._sign_markers)}",
                 f"Zoom      : {self._cam_zoom:.3f}",
             ]
+        if self._gif_recording:
+            lines.append(f"GIF       : REC {len(self._gif_recording.get('frames', []))} frame")
         for line in lines:
             self._text(screen, line, (px0, stats_y), self._font_ui_sm, TEXT)
             stats_y += 18
@@ -1001,3 +1224,4 @@ class SumoRenderer:
     def _cleanup(self) -> None:
         if self._sim_running:
             self._stop_simulation()
+        self._finish_gif_recording("chiusura renderer")
